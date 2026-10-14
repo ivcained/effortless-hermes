@@ -1,0 +1,73 @@
+name: effortless-hermes
+version: 0.2.0
+description: "Picks the reasoning effort for every prompt via a fast judge (Jev/TypeSafe, a local model, or any custom OpenAI-compatible API) and rewrites the LLM request before it ships. Port of HeyCubit/effortless."
+author: "ivcained"
+license: MIT
+kind: standalone
+manifest_version: 2
+requires_hermes: ">=0.21.7"
+optional_env:
+  - TYPESAFE_API_KEY
+tags: [reasoning, effort, cost, judge]
+provides_hooks: []
+provides_middleware:
+  - llm_request
+config_schema:
+  enabled:
+    type: bool
+    default: true
+    description: "Master switch. False disables all judging."
+  judge_backend:
+    type: str
+    default: jev
+    description: "Primary judge: jev (TypeSafe), local (OpenAI-compatible local server), or custom (your own API)."
+  fallback_backend:
+    type: str
+    default: local
+    description: "Second judge when the primary is unsure, down, or slow: local, custom, or none."
+  jev_url:
+    type: str
+    default: https://api.typesafe.ai/v1/systemone
+    description: "TypeSafe Jev endpoint."
+  jev_model:
+    type: str
+    default: jev-latest
+    description: "Jev model name."
+  typesafe_key:
+    type: secret
+    description: "TypeSafe API key for the jev judge. Stored in .env as EFFORTLESS_HERMES_TYPESAFE_KEY. Empty = TYPESAFE_API_KEY (env) is used."
+  local_base_url:
+    type: str
+    default: http://127.0.0.1:8080/v1
+    description: "OpenAI-compatible base URL of the local judge model."
+  local_model:
+    type: str
+    default: ""
+    description: "Local judge model id. Empty = 'local-model'."
+  custom_base_url:
+    type: str
+    default: ""
+    description: "OpenAI-compatible base URL of a custom judge API."
+  custom_model:
+    type: str
+    default: ""
+    description: "Custom judge model id."
+  custom_api_key:
+    type: secret
+    description: "API key for the custom judge. Stored in .env as EFFORTLESS_HERMES_CUSTOM_API_KEY. Empty = no Authorization header."
+  judge_timeout_seconds:
+    type: float
+    default: 3.0
+    description: "Per-judge timeout; a slow judge falls through to the next."
+  effort_floor:
+    type: str
+    default: low
+    description: "Never pick below this effort (low/medium/high/xhigh/max)."
+  effort_ceiling:
+    type: str
+    default: max
+    description: "Never pick above this effort (low/medium/high/xhigh/max)."
+  effort_bias:
+    type: int
+    default: 0
+    description: "-2 cheaper .. +2 smarter; tips the judge's close calls."
