@@ -35,7 +35,43 @@ the plugin never blocks a prompt.
 
 `enabled` (bool, true) · `judge_backend` (jev|local|custom) · `fallback_backend` (local|custom|jev|none)
 · `judge_timeout_seconds` (3.0) · `effort_floor` (low) · `effort_ceiling` (max) ·
-`effort_bias` (-2..+2) · judge connection keys per the table above.
+`effort_bias` (-2..+2) · `model_map` (dict, off) · `model_map_always` (bool, false) ·
+judge connection keys per the table above.
+
+## Per-turn telemetry and `/effortless stats`
+
+A `post_api_request` observer hook records the first request of every turn — input
+tokens, context length, duration, model — into the plugin's profile-scoped state.
+`/effortless` shows the latest context fill; `/effortless stats` aggregates the recent
+window: verdicts per effort, per judge, average judge latency, average input tokens and
+context fill. There is deliberately **no cost-savings estimate** — what a prompt would
+have cost at another effort is not knowable (same honesty rule as upstream effortless).
+Cache warmth is not reported: the hook payload carries usage and timing, but no explicit
+cache-hit field, and we won't guess one.
+
+## Effort→model mapping (opt-in, cache-aware)
+
+`model_map` lets a verdict steer the model, not just the effort, for multi-model
+gateways:
+
+```yaml
+plugins:
+  entries:
+    effortless-hermes:
+      settings:
+        model_map: { low: <cheap model id>, medium: <balanced id>, high: <strong id> }
+```
+
+- Applies to the whole turn (reapplied on retries), never mid-turn.
+- **By default it only fires on a fresh chat** (first user turn). In an established
+  chat, switching models re-reads the entire conversation at full price on the new
+  model — the provider prompt cache is keyed by model. `model_map_always: true`
+  opts into that cost explicitly.
+- Model ids must be servable by the chat's **own provider** — the middleware swaps the
+  model id on the request; it does not switch providers, keys, or endpoints.
+- This is generic on purpose: any OpenAI-compatible router that serves several models
+  behind one endpoint (a self-hosted router, an aggregator) can be driven by effort
+  verdicts. No specific gateway is named or required.
 
 ## Commands
 
@@ -51,6 +87,9 @@ the plugin never blocks a prompt.
   configure (default `127.0.0.1:8080`); the `custom` backend to your configured API.
   No other data leaves the machine; there is no telemetry, no usage reporting, no file
   access beyond the plugin's own state.
+- **Read-only telemetry**: a `post_api_request` observer hook reads token usage and
+  context length from Hermes' own hook payloads and stores them locally in plugin state
+  for the `/effortless stats` command. Nothing is sent anywhere.
 - **Latency budget**: each judge is bounded by `judge_timeout_seconds` (default 3 s; local
   and custom judges allow up to 8 s). A judge that hangs is abandoned, not awaited.
 - **Credentials**: keys come from the settings hub (stored in Hermes' `.env`) or the

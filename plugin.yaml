@@ -1,5 +1,5 @@
 name: effortless-hermes
-version: 0.2.0
+version: 0.3.0
 description: "Picks the reasoning effort for every prompt via a fast judge (Jev/TypeSafe, a local model, or any custom OpenAI-compatible API) and rewrites the LLM request before it ships. Port of HeyCubit/effortless."
 author: "ivcained"
 license: MIT
@@ -9,7 +9,8 @@ requires_hermes: ">=0.21.7"
 optional_env:
   - TYPESAFE_API_KEY
 tags: [reasoning, effort, cost, judge]
-provides_hooks: []
+provides_hooks:
+  - post_api_request
 provides_middleware:
   - llm_request
 config_schema:
@@ -71,3 +72,11 @@ config_schema:
     type: int
     default: 0
     description: "-2 cheaper .. +2 smarter; tips the judge's close calls."
+  model_map:
+    type: dict
+    default: {}
+    description: "Opt-in effort-to-model mapping, e.g. {low: cheap-model, high: strong-model}. Applies for a whole turn; by default only on a fresh chat (first user turn) because a model switch invalidates the provider prompt cache. Model ids must be servable by the chat's own provider."
+  model_map_always:
+    type: bool
+    default: false
+    description: "Apply model_map even in established chats, accepting the prompt-cache reset it costs."

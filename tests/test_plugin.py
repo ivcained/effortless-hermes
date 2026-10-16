@@ -250,6 +250,135 @@ def test_no_carrier_no_crash():
         core._run_judges = orig
 
 
+
+
+# ── v0.3: model_map, post_api_request, stats ─────────────────────────────────
+
+def test_model_map_fresh_chat_applies():
+    ctx = FakeCtx({"model_map": {"high": "strong-model", "low": "cheap-model"}})
+    v = J.Verdict("high", "big job", "stub", sure=0.9)
+    orig = core._run_judges
+    core._run_judges = lambda cfg, p, c, x: (v, "")
+    try:
+        req = _req()  # one user message = fresh chat
+        res = _run_middleware(ctx, req)
+        assert req["model"] == "strong-model"
+        assert req["reasoning_effort"] == "high"
+        assert "model: strong-model" in res["reason"]
+    finally:
+        core._run_judges = orig
+
+
+def test_model_map_established_chat_skips():
+    ctx = FakeCtx({"model_map": {"high": "strong-model"}})
+    v = J.Verdict("high", "big job", "stub", sure=0.9)
+    orig = core._run_judges
+    core._run_judges = lambda cfg, p, c, x: (v, "")
+    try:
+        req = _req()
+        req["messages"] = [{"role": "user", "content": "first"},
+                           {"role": "assistant", "content": "hi"},
+                           {"role": "user", "content": "do a big refactor of everything"}]
+        res = _run_middleware(ctx, req)
+        assert req["model"] == "glm-5.3"  # unchanged: cache safety
+        assert "model" not in (res["reason"] if res else "")
+    finally:
+        core._run_judges = orig
+
+
+def test_model_map_always_overrides():
+    ctx = FakeCtx({"model_map": {"high": "strong-model"}, "model_map_always": True})
+    v = J.Verdict("high", "big job", "stub", sure=0.9)
+    orig = core._run_judges
+    core._run_judges = lambda cfg, p, c, x: (v, "")
+    try:
+        req = _req()
+        req["messages"] = [{"role": "user", "content": "first"},
+                           {"role": "assistant", "content": "hi"},
+                           {"role": "user", "content": "do a big refactor of everything"}]
+        _run_middleware(ctx, req)
+        assert req["model"] == "strong-model"
+    finally:
+        core._run_judges = orig
+
+
+def test_model_map_reapplied_on_retry():
+    ctx = FakeCtx({"model_map": {"high": "strong-model"}})
+    v = J.Verdict("high", "big job", "stub", sure=0.9)
+    orig = core._run_judges
+    core._run_judges = lambda cfg, p, c, x: (v, "")
+    try:
+        req = _req()
+        _run_middleware(ctx, req, turn="t9", session="s9")
+        req2 = _req()  # rebuilt by a retry: model and effort must come back
+        res = core.on_llm_request(req2, session_id="s9", turn_id="t9", model="glm-5.3")
+        assert req2["model"] == "strong-model"
+        assert req2["reasoning_effort"] == "high"
+        assert res is not None
+    finally:
+        core._run_judges = orig
+
+
+def test_model_map_noop_when_same_model():
+    ctx = FakeCtx({"model_map": {"high": "glm-5.3"}})
+    v = J.Verdict("high", "big job", "stub", sure=0.9)
+    orig = core._run_judges
+    core._run_judges = lambda cfg, p, c, x: (v, "")
+    try:
+        req = _req()
+        res = _run_middleware(ctx, req)
+        assert req["model"] == "glm-5.3"
+        assert not ctx.state.get("verdicts")[-1].get("model_override")
+    finally:
+        core._run_judges = orig
+
+
+def test_post_api_request_records_first_call_only():
+    ctx = FakeCtx()
+    core._plugin_ctx = ctx
+    core.on_post_api_request(session_id="sx", api_call_count=1,
+                             model="glm-5.3", usage={"prompt_tokens": 12000, "total_tokens": 12500},
+                             context_length=65536, api_duration=1.5)
+    core.on_post_api_request(session_id="sx", api_call_count=2,
+                             model="glm-5.3", usage={"prompt_tokens": 12200},
+                             context_length=65536, api_duration=0.4)
+    turns = ctx.state.get("turns")
+    assert len(turns) == 1
+    assert turns[0]["input_tokens"] == 12000
+    assert turns[0]["context_length"] == 65536
+
+
+def test_context_fill():
+    assert core._context_fill({"input_tokens": 32768, "context_length": 65536}) == 50
+    assert core._context_fill({"input_tokens": 65536, "context_length": 65536}) == 100
+    assert core._context_fill({"input_tokens": 100}) is None
+    assert core._context_fill(None) is None
+
+
+def test_stats_output():
+    ctx = FakeCtx()
+    core._plugin_ctx = ctx
+    ctx.state.set("verdicts", [
+        {"ts": "t", "effort": "low", "by": "jev", "sure": 0.9, "why": "", "ms": 300, "prompt": "p", "note": ""},
+        {"ts": "t", "effort": "high", "by": "jev", "sure": 0.8, "why": "", "ms": 400, "prompt": "p", "note": ""},
+        {"ts": "t", "effort": None, "by": None, "sure": None, "why": "follow-up", "ms": 0, "prompt": "p", "note": ""},
+    ])
+    ctx.state.set("turns", [{"input_tokens": 20000, "context_length": 65536}])
+    out = core._fmt_stats(ctx)
+    assert "low×1" in out and "high×1" in out
+    assert "jev×2" in out
+    assert "avg 350 ms" in out
+    assert "31% of window" in out
+    assert "no cost-savings estimate" in out
+
+
+def test_command_stats_route():
+    ctx = FakeCtx()
+    core._plugin_ctx = ctx
+    out = core._command_effortless("stats")
+    assert "stats" in out and "verdicts recorded" in out
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):
