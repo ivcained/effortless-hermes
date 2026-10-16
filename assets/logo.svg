@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="needle" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#C6FF3F"/>
+      <stop offset="100%" stop-color="#EFFF9E"/>
+    </linearGradient>
+    <linearGradient id="arc" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#3E4A2E"/>
+      <stop offset="70%" stop-color="#8FBF3A"/>
+      <stop offset="100%" stop-color="#C6FF3F"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.62" r="0.5">
+      <stop offset="0%" stop-color="#C6FF3F" stop-opacity="0.22"/>
+      <stop offset="100%" stop-color="#C6FF3F" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <!-- tile -->
+  <rect x="16" y="16" width="480" height="480" rx="108" fill="#0A0B09"/>
+  <rect x="16" y="16" width="480" height="480" rx="108" fill="url(#glow)"/>
+  <rect x="16" y="16" width="480" height="480" rx="108" fill="none" stroke="#232819" stroke-width="3"/>
+
+  <!-- dial -->
+  <g transform="translate(256,300)">
+    <path d="M -150 0 A 150 150 0 0 1 150 0" fill="none" stroke="#22271C" stroke-width="16" stroke-linecap="round"/>
+    <path d="M -150 0 A 150 150 0 0 1 0 -150" fill="none" stroke="url(#arc)" stroke-width="16" stroke-linecap="round"/>
+    <g stroke="#3A4130" stroke-width="5" stroke-linecap="round">
+      <line x1="-172" y1="0" x2="-156" y2="0"/>
+      <line x1="-121.6" y1="-121.6" x2="-110.3" y2="-110.3"/>
+      <line x1="0" y1="-172" x2="0" y2="-156"/>
+      <line x1="121.6" y1="-121.6" x2="110.3" y2="-110.3"/>
+      <line x1="172" y1="0" x2="156" y2="0"/>
+    </g>
+    <!-- needle at 'high' -->
+    <line x1="0" y1="0" x2="0" y2="-136" stroke="#C6FF3F" stroke-width="11" stroke-linecap="round"/>
+    <circle cx="0" cy="0" r="16" fill="#C6FF3F"/>
+    <circle cx="0" cy="0" r="6.5" fill="#0A0B09"/>
+    <!-- wordmark -->
+    <g font-family="Helvetica Neue, Helvetica, Arial" font-weight="700" font-size="46" fill="#F4F7EF" text-anchor="middle" letter-spacing="-0.5">
+      <text x="0" y="102">effortless<tspan fill="#C6FF3F">-hermes</tspan></text>
+    </g>
+  </g>
+</svg>
