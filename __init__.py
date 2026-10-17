@@ -303,11 +303,43 @@ def _on_llm_request(request: dict, **ctx: Any) -> Optional[dict]:
 
     session_id = str(ctx.get("session_id") or "?")
     turn_id = str(ctx.get("turn_id") or "")
+    base_url = str(ctx.get("base_url") or "")
+
+    # sanitize an effort the provider would reject (e.g. a config-level
+    # 'medium' on a route that only accepts low/high/max). Runs on EVERY
+    # request — follow-ups, judge-down turns and retries can ship a 400 too,
+    # not just the first call of a turn.
+    sanitized_reason = ""
+    _early_effort = _read_current_effort(request)
+    if _early_effort:
+        _early_model = str(request.get("model") or ctx.get("model") or "")
+        fixed = J.clamp_to_wire(_early_effort, _early_model, base_url,
+                                request.get("tools"))
+        if fixed != _early_effort and _write_effort(request, fixed):
+            sanitized_reason = f"sanitized {_early_effort} -> {fixed} (outside provider knob)"
+
+    def _ret(result: Optional[dict], note: str = "") -> Optional[dict]:
+        """Never drop a sanitized (mutated) request on a None return."""
+        if result is not None:
+            return result
+        if sanitized_reason:
+            return {"request": request, "source": "effortless-hermes",
+                    "reason": note or sanitized_reason}
+        return None
+
     with _lock:
         if _last_turn.get(session_id) == turn_id and turn_id:
             # already judged this turn; a retry rebuilt the request, so reapply
             cached_effort = _last_effort.get(session_id)
             cached_model = _last_model.get(session_id)
+            # the rebuilt request may be agentic (tools) or on a different
+            # route than the one the effort was judged for — re-clamp it
+            # against the current request, never paste it verbatim.
+            if cached_effort:
+                r_model = str(request.get("model") or ctx.get("model") or "")
+                clamped = J.clamp_to_wire(
+                    cached_effort, r_model, base_url, request.get("tools"))
+                cached_effort = clamped
             changed = False
             if cached_effort and _write_effort(request, cached_effort):
                 changed = True
@@ -317,18 +349,24 @@ def _on_llm_request(request: dict, **ctx: Any) -> Optional[dict]:
             if changed:
                 return {"request": request, "source": "effortless-hermes",
                         "reason": f"reapply {cached_effort} (retried request)"}
-            return None  # tool-loop follow-ups keep the request as built
+            return _ret(None)  # tool-loop follow-ups keep the request as built
         _last_turn[session_id] = turn_id
 
+    if sanitized_reason:
+        _record(ctx_obj, None, "", sanitized_reason)
     msgs = _messages(request)
     if not msgs:
-        return None
+        return _ret(None)
     prompt = _last_user_message(msgs)
     if not prompt.strip():
-        return None
+        return _ret(None)
     context = _recent_context(msgs)
     current_effort = _read_current_effort(request)
     model = str(request.get("model") or ctx.get("model") or "")
+    request_tools = request.get("tools")
+
+    def _clamp(effort: str) -> str:
+        return J.clamp_to_wire(effort, model, base_url, request_tools)
 
     floor = str(cfg["effort_floor"]); ceiling = str(cfg["effort_ceiling"])
     bias = int(cfg["effort_bias"] or 0)
@@ -337,7 +375,7 @@ def _on_llm_request(request: dict, **ctx: Any) -> Optional[dict]:
     named = J.named_effort(prompt)
     if named:
         effort = J.apply_bounds(named, floor, ceiling, bias)
-        effort = J.clamp_to_wire(effort, model)
+        effort = _clamp(effort)
         if _write_effort(request, effort):
             _last_effort[session_id] = effort
             applied_model = _apply_model_map(cfg, request, msgs, effort)
@@ -347,26 +385,26 @@ def _on_llm_request(request: dict, **ctx: Any) -> Optional[dict]:
                     extra={"model_override": applied_model})
             reason = f"named: {effort}" + (f" · model: {applied_model}" if applied_model else "")
             return {"request": request, "source": "effortless-hermes", "reason": reason}
-        return None
+        return _ret(None)
 
     # 2. short follow-up keeps the current effort
     if current_effort and J.keeps_effort(prompt, context):
         _last_effort[session_id] = current_effort
         _record(ctx_obj, None, prompt, "follow-up, kept effort")
-        return None
+        return _ret(None)
 
     # 3. ask the judges
     verdict, note = _run_judges(cfg, prompt, current_effort, context)
     if verdict is None:
         _record(ctx_obj, None, prompt, note)
-        return None
+        return _ret(None)
 
     effort = J.apply_bounds(verdict.effort, floor, ceiling, bias)
-    effort = J.clamp_to_wire(effort, model)
+    effort = _clamp(effort)
     if effort == current_effort:
         _last_effort[session_id] = effort
         _record(ctx_obj, verdict, prompt, "same as current, unchanged")
-        return None
+        return _ret(None)
     if _write_effort(request, effort):
         _last_effort[session_id] = effort
         applied_model = _apply_model_map(cfg, request, msgs, effort)
@@ -381,7 +419,7 @@ def _on_llm_request(request: dict, **ctx: Any) -> Optional[dict]:
             reason += f" · model: {applied_model}"
         return {"request": request, "source": "effortless-hermes", "reason": reason}
     _record(ctx_obj, verdict, prompt, "no effort carrier on this provider; skipped")
-    return None
+    return _ret(None)
 
 
 # ── /effortless command ──────────────────────────────────────────────────────

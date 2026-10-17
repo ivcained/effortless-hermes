@@ -99,6 +99,32 @@ plugins:
 - **Code**: pure-stdlib Python (urllib), no pip dependencies, no shell-outs, no background
   processes, no self-updating code.
 
+## Provider effort vocabularies (why your request might have 400'd)
+
+Providers accept different `reasoning_effort` vocabularies, and some accept
+different ones per route. The plugin clamps every effort it writes — and now
+also every effort already on the request — to the vocabulary the current
+provider/model pair accepts:
+
+| Route | Accepted | medium maps to |
+|---|---|---|
+| Surplus Intelligence (`api.surplusintelligence.ai`), agentic requests (any model) | `low`, `high`, `max` | `high` |
+| glm-5.3 (direct), glm-4.5, deepseek | `low`–`high`/`max` incl. `medium` | `medium` (legal) |
+| kimi-k3 | `low`, `high`, `max` | `high` |
+| unknown | full ladder | `medium` (legal) |
+
+Two behaviors worth knowing:
+
+- **Sanitize-before-ship**: if the request already carries an effort the
+  provider would reject (a config-level `agent.reasoning_effort: medium` on a
+  low/high/max route, for example), the middleware rewrites it to the nearest
+  accepted level on *every* request — including follow-ups, judge-outage turns
+  and retries — so a provider 400 (`'reasoning_effort' must be one of:
+  'low', 'high', 'max'`) can't ship.
+- **medium → high, not low**: on restricted ladders a judged `medium` maps up
+  to `high`. The judge called the prompt "normal work: a few tool calls";
+  `low` means "no tools, no planning", which would under-power it.
+
 ## Verified
 
 - 2026-10-14, Hermes v0.21.7, glm-5.3 via surplusintelligence:
@@ -115,3 +141,12 @@ carriers (providers without a text effort carrier are skipped, never guessed).
 ## License
 
 MIT. Judge prompts and heuristics adapted from HeyCubit/effortless (MIT).
+
+## Changelog
+
+- 0.3.1 (2026-10-17): Surp-hosted glm-5.3 clamps to low/high/max. Live-verified:
+  api.surplusintelligence.ai accepts medium/xhigh on plain chat but 400s on
+  agentic requests (tools attached or long agent-style history) with
+  "'reasoning_effort' must be one of: 'low', 'high', 'max'". Wire vocabularies
+  now take `base_url`/`tools`, and cached per-turn efforts are re-clamped on
+  retry re-apply instead of being pasted verbatim.

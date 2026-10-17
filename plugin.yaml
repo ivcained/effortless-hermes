@@ -1,5 +1,5 @@
 name: effortless-hermes
-version: 0.3.0
+version: 0.3.2
 description: "Picks the reasoning effort for every prompt via a fast judge (Jev/TypeSafe, a local model, or any custom OpenAI-compatible API) and rewrites the LLM request before it ships. Port of HeyCubit/effortless."
 author: "ivcained"
 license: MIT

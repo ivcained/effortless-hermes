@@ -155,13 +155,14 @@ def _req(prompt="do a big refactor of everything", effort="medium"):
             "messages": [{"role": "user", "content": prompt}]}
 
 
-def _run_middleware(fake_ctx, request, turn="t1", session="s1"):
+def _run_middleware(fake_ctx, request, turn="t1", session="s1", base_url=""):
     core._plugin_ctx = fake_ctx
     core._last_turn.pop(session, None)
     core._last_effort.pop(session, None)
+    core._last_model.pop(session, None)
     return core.on_llm_request(request, session_id=session, turn_id=turn,
-                               model="glm-5.3", provider="x", api_mode="chat_completions",
-                               api_call_count=1)
+                               model="glm-5.3", provider="x", base_url=base_url,
+                               api_mode="chat_completions", api_call_count=1)
 
 
 def test_middleware_named_level_skips_judge(monkeypatch_none=None):
@@ -377,6 +378,136 @@ def test_command_stats_route():
     core._plugin_ctx = ctx
     out = core._command_effortless("stats")
     assert "stats" in out and "verdicts recorded" in out
+
+
+# ── Surplus Intelligence glm-5.3: agentic routes accept low/high/max only ────
+# Live-verified 2026-10-17: plain chat accepts xhigh/medium fine, but any
+# request with `tools` (or a long agent-style history) 400s with
+# "'reasoning_effort' must be one of: 'low', 'high', 'max'".
+
+def test_clamp_to_wire_surp_glm53_agentic_accepts_only_lhm():
+    assert J.clamp_to_wire("xhigh", "glm-5.3", tools=[{"type": "function"}]) == "max"
+    # medium is illegal on Surp's agentic routes; it maps UP to high, not down
+    # to low: the judge called the prompt "normal work" (a few tool calls) and
+    # low means "no tools, no planning" — downgrading under-powers the prompt.
+    assert J.clamp_to_wire("medium", "glm-5.3", tools=[{"type": "function"}]) == "high"
+    assert J.clamp_to_wire("high", "glm-5.3", tools=[{"type": "function"}]) == "high"
+    assert J.clamp_to_wire("low", "glm-5.3", tools=[{"type": "function"}]) == "low"
+    assert J.clamp_to_wire("max", "glm-5.3", tools=[{"type": "function"}]) == "max"
+
+
+def test_clamp_to_wire_surp_any_model_agentic():
+    # the live 400 (2026-10-17) fired on gpt-6.1-sol, not glm: the restricted
+    # triple applies to ANY model the provider relays once the request is agentic
+    surp = "https://api.surplusintelligence.ai/v1"
+    tools = [{"type": "function"}]
+    assert J.wire_vocabulary("gpt-6.1-sol", base_url=surp, tools=tools) == ("low", "high", "max")
+    assert J.clamp_to_wire("medium", "gpt-6.1-sol", base_url=surp, tools=tools) == "high"
+    assert J.clamp_to_wire("xhigh", "gpt-6.1-sol", base_url=surp, tools=tools) == "max"
+    assert J.clamp_to_wire("low", "gpt-6.1-sol", base_url=surp, tools=tools) == "low"
+    # non-agentic, non-glm via surp: model table applies (unverified territory
+    # stays open rather than guessed)
+    assert J.wire_vocabulary("gpt-6.1-sol", base_url=surp) == J._DEFAULT_VOCAB
+    # same model on a different provider is untouched by the surp rule
+    assert J.wire_vocabulary("gpt-6.1-sol", base_url="https://api.openai.com/v1") == J._DEFAULT_VOCAB
+
+
+def test_clamp_to_wire_surp_plain_chat_unchanged():
+    # No tools: plain-chat vocab applies, medium stays verbatim.
+    assert J.clamp_to_wire("medium", "glm-5.3") == "medium"
+
+
+def test_wire_vocabulary_provider_rule():
+    # base_url rules key off the provider, not the model, when present.
+    assert J.wire_vocabulary("glm-5.3", base_url="https://api.surplusintelligence.ai/v1") == ("low", "high", "max")
+
+
+def test_middleware_surp_agentic_clamps_medium():
+    ctx = FakeCtx({"judge_backend": "jev"})
+    v = J.Verdict("medium", "normal", "stub", sure=0.9)
+    orig = core._run_judges
+    core._run_judges = lambda cfg, p, c, x: (v, "")
+    try:
+        req = _req()  # no tools: plain-chat vocab applies, medium stays
+        _run_middleware(ctx, req)
+        assert req["reasoning_effort"] == "medium"
+        req2 = _req()
+        req2["tools"] = [{"type": "function", "function": {"name": "f"}}]
+        _run_middleware(ctx, req2, turn="t2", session="s2")
+        assert req2["reasoning_effort"] == "high"  # agentic Surp: medium illegal -> high
+    finally:
+        core._run_judges = orig
+
+
+def test_middleware_cached_effort_reapplied_clamps_on_retry():
+    # Retry rebuilt the request; the cached effort must be re-clamped against
+    # the rebuilt request (tools), not pasted verbatim (the 01M543N9... 400).
+    ctx = FakeCtx({"judge_backend": "jev"})
+    v = J.Verdict("xhigh", "hard", "stub", sure=0.9)
+    orig = core._run_judges
+    core._run_judges = lambda cfg, p, c, x: (v, "")
+    try:
+        req = _req()  # plain chat: judged effort stored
+        _run_middleware(ctx, req, turn="t1", session="sx")
+        req2 = _req()
+        req2["tools"] = [{"type": "function"}]  # agentic retry
+        core.on_llm_request(req2, session_id="sx", turn_id="t1", model="glm-5.3")
+        assert req2["reasoning_effort"] in ("low", "high", "max")  # never xhigh on agentic Surp
+    finally:
+        core._run_judges = orig
+
+
+SURP = "https://api.surplusintelligence.ai/v1"
+AG = [{"type": "function", "function": {"name": "f"}}]
+
+
+def test_sanitize_config_medium_on_agentic_surp():
+    # the live incident: config sets 'medium', provider rejects it. Even with
+    # no verdict (judges down) and a follow-up prompt, the request must ship
+    # with a legal effort.
+    ctx = FakeCtx({"judge_backend": "jev", "fallback_backend": "local",
+                   "local_base_url": "http://127.0.0.1:1/v1"})  # judges all down
+    req = {"model": "gpt-6.1-sol", "reasoning_effort": "medium",
+           "messages": [{"role": "user", "content": "ok"}], "tools": AG}
+    res = _run_middleware(ctx, req, base_url=SURP)
+    assert req["reasoning_effort"] == "high"  # sanitized, medium -> high
+    assert res is not None and "sanitized" in res["reason"]
+
+
+def test_sanitize_config_medium_no_carrier_untouched():
+    # no effort carrier -> nothing invented, nothing broken
+    ctx = FakeCtx({"judge_backend": "jev"})
+    req = {"model": "gpt-6.1-sol",
+           "messages": [{"role": "user", "content": "hi"}], "tools": AG}
+    res = _run_middleware(ctx, req, base_url=SURP)
+    assert "reasoning_effort" not in req
+
+
+def test_sanitize_on_retry_of_unjudged_turn():
+    # retry rebuilt the request; the turn was never judged (judge down) so no
+    # cached effort exists — the sanitize alone must still fix the 400 carrier
+    ctx = FakeCtx({"judge_backend": "jev", "fallback_backend": "local",
+                   "local_base_url": "http://127.0.0.1:1/v1"})
+    req = {"model": "gpt-6.1-sol", "reasoning_effort": "medium",
+           "messages": [{"role": "user", "content": "what is 2+2"}], "tools": AG}
+    res = _run_middleware(ctx, req, turn="t1", session="sr", base_url=SURP)
+    assert req["reasoning_effort"] == "high"
+    req2 = {"model": "gpt-6.1-sol", "reasoning_effort": "medium",
+            "messages": [{"role": "user", "content": "what is 2+2"}], "tools": AG}
+    res2 = core.on_llm_request(req2, session_id="sr", turn_id="t1", model="gpt-6.1-sol",
+                               base_url=SURP, api_mode="chat_completions")
+    assert req2["reasoning_effort"] == "high"
+    assert res2 is not None
+
+
+def test_no_sanitize_when_effort_is_legal():
+    # deepseek accepts medium; a surp base_url with a NON-agentic request and a
+    # non-glm model must not touch a legal value
+    ctx = FakeCtx({"judge_backend": "jev"})
+    req = {"model": "deepseek-v4.1-flash", "reasoning_effort": "medium",
+           "messages": [{"role": "user", "content": "hi"}]}
+    _run_middleware(ctx, req, base_url=SURP)
+    assert req["reasoning_effort"] == "medium"
 
 
 if __name__ == "__main__":

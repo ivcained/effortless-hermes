@@ -24,11 +24,17 @@ _WIRE_VOCAB: list[tuple[str, tuple[str, ...]]] = [
     ("glm-4.5", ("low", "medium", "high")),
 ]
 _DEFAULT_VOCAB = ("low", "medium", "high", "xhigh", "max")
-_WIRE_OVERRIDES = {  # nearest-weaker map where the ladder has gaps
+_WIRE_OVERRIDES = {  # nearest-accepted map where the ladder has gaps
     "glm-5.3": {"xhigh": "max"},
     "glm-5.2": {"low": "high", "medium": "high", "xhigh": "max"},
     "k3": {"medium": "high", "xhigh": "max"},
 }
+# Providers that accept exactly low/high/max (the restricted triple). medium maps
+# UP to high, not down to low: the judge called the prompt "normal work"
+# (a few tool calls) — low means "no tools, no planning", which under-powers it.
+# Same convention as the k3 mapping. xhigh maps to max.
+_TRIPLE_VOCAB = ("low", "high", "max")
+_TRIPLE_OVERRIDES = {"medium": "high", "xhigh": "max"}
 
 JUDGE_SYSTEM = """You choose which reasoning effort an agentic assistant (it reads files, runs tools and edits things, not only code) should use for the user's next message. Pick the cheapest effort that will still do the job well.
 
@@ -219,21 +225,54 @@ def ask_openai_compat(cfg: dict, which: str, prompt: str, current_effort: Option
 
 # ── Wire clamping (vocabulary per model, then floor/ceiling/bias) ────────────
 
-def wire_vocabulary(model: str) -> tuple[str, ...]:
+# Surplus Intelligence (api.surplusintelligence.ai) accepts glm-5.3's full
+# scale on plain one-shot chat, but rejects anything but low/high/max once the
+# request is agentic (tools attached or a long agent-style history) — and the
+# same 400 fires for other models it relays (live-verified 2026-10-17 on
+# gpt-6.1-sol: "'reasoning_effort' must be one of: 'low', 'high', 'max'",
+# request id 01M542VPWVB11AQ0SNWYMGS1RT). Hermes requests are always agentic
+# (tools on every turn), so any Surp-hosted agentic request — any model —
+# clamps to the restricted triple.
+_SURP_URL_NEEDLE = "surplusintelligence"
+
+
+def _is_agentic_request(tools: Any) -> bool:
+    return bool(tools)
+
+
+def wire_vocabulary(model: str, base_url: Optional[str] = None,
+                    tools: Any = None) -> tuple[str, ...]:
     m = (model or "").lower()
+    url = (base_url or "").lower()
+    if _SURP_URL_NEEDLE in url:
+        if _is_agentic_request(tools) or "glm-5.3" in m:
+            return _TRIPLE_VOCAB
+    elif not url and "glm-5.3" in m and _is_agentic_request(tools):
+        # no provider info and an agentic glm-5.3 request: be safe and use the
+        # restricted triple (real middleware calls always carry base_url, so
+        # direct-z.ai requests with their full scale are not affected).
+        return _TRIPLE_VOCAB
     for needle, vocab in _WIRE_VOCAB:
         if needle in m:
             return vocab
     return _DEFAULT_VOCAB
 
 
-def clamp_to_wire(effort: str, model: str) -> str:
-    vocab = wire_vocabulary(model)
+def clamp_to_wire(effort: str, model: str, base_url: Optional[str] = None,
+                  tools: Any = None) -> str:
+    vocab = wire_vocabulary(model, base_url, tools)
     if effort in vocab:
         return effort
+    if vocab == _TRIPLE_VOCAB and effort in _TRIPLE_OVERRIDES:
+        # restricted providers: keep the verdict's intent (medium -> high),
+        # never silently downgrade judged "normal work" to a no-tools low.
+        return _TRIPLE_OVERRIDES[effort]
+    m = (model or "").lower()
     for needle, overrides in _WIRE_OVERRIDES.items():
-        if needle in (model or "").lower() and effort in overrides:
-            return overrides[effort]
+        if needle in m and effort in overrides:
+            mapped = overrides[effort]
+            if mapped in vocab:
+                return mapped
     # nearest weaker level
     ladder = [e for e in EFFORTS if e in vocab]
     idx = EFFORTS.index(effort)
