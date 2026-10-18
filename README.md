@@ -1,3 +1,6 @@
+<img width="1200" height="600" alt="effortless-hermes" src="https://github.com/user-attachments/assets/ac690ccc-148b-43d6-9232-9abc0447e991" />
+
+
 # effortless-hermes
 
 A Hermes port of [HeyCubit/effortless](https://github.com/HeyCubit/effortless) (MIT): a fast
