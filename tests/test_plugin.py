@@ -510,6 +510,194 @@ def test_no_sanitize_when_effort_is_legal():
     assert req["reasoning_effort"] == "medium"
 
 
+# ── v0.4: outcome feedback loop (failure escalates, clean streaks decay) ─────
+
+class RecordingCtx(FakeCtx):
+    def __init__(self, settings=None):
+        super().__init__(settings)
+        self.middleware = {}
+        self.hooks = {}
+
+    def register_middleware(self, name, fn):
+        self.middleware[name] = fn
+
+    def register_hook(self, name, fn):
+        self.hooks[name] = fn
+
+    def register_command(self, *a, **k):
+        pass
+
+
+def _reset_feedback():
+    core._session_bias.clear()
+    core._clean_streak.clear()
+
+
+def test_register_registers_all_surfaces():
+    ctx = RecordingCtx({})
+    core.register(ctx)
+    assert "llm_request" in ctx.middleware
+    assert "post_api_request" in ctx.hooks
+    assert "api_request_error" in ctx.hooks  # the v0.4 failure observer
+
+
+def test_feedback_escalates_on_incomplete_response():
+    _reset_feedback()
+    ctx = FakeCtx({"judge_backend": "jev"})
+    core._plugin_ctx = ctx
+    core.on_api_request_error(session_id="fb1", turn_id="t", reason="incomplete_response",
+                              error={"type": "APIError", "message": "truncated stream"})
+    assert core._session_bias.get("fb1") == 1
+    v = J.Verdict("medium", "normal", "stub", sure=0.9)
+    orig = core._run_judges
+    core._run_judges = lambda cfg, p, c, x: (v, "")
+    try:
+        req = _req()
+        _run_middleware(ctx, req, turn="tf1", session="fb1")
+        assert req["reasoning_effort"] == "high"  # medium + 1 failure bias
+    finally:
+        core._run_judges = orig
+        _reset_feedback()
+
+
+def test_feedback_ignores_rate_limit_shape_and_auth_errors():
+    _reset_feedback()
+    core._plugin_ctx = FakeCtx({})
+    core.on_api_request_error(session_id="fb2", turn_id="t", reason="rate_limit",
+                              status_code=429, error={"type": "RateLimitError", "message": "slow down"})
+    core.on_api_request_error(session_id="fb2", turn_id="t", reason="bad_request",
+                              status_code=400, error={"type": "BadRequestError", "message": "request_rejected"})
+    core.on_api_request_error(session_id="fb2", turn_id="t", reason="auth",
+                              status_code=401, error={"type": "AuthenticationError", "message": "invalid key"})
+    assert core._session_bias.get("fb2", 0) == 0
+    _reset_feedback()
+
+
+def test_feedback_escalates_on_finish_reason_error():
+    _reset_feedback()
+    ctx = FakeCtx({})
+    core._plugin_ctx = ctx
+    core.on_post_api_request(session_id="fb3", api_call_count=1, model="glm-5.3",
+                             finish_reason="error", usage={"prompt_tokens": 10},
+                             context_length=65536, api_duration=0.5)
+    assert core._session_bias.get("fb3") == 1
+    v = J.Verdict("low", "quick", "stub", sure=0.9)
+    orig = core._run_judges
+    core._run_judges = lambda cfg, p, c, x: (v, "")
+    try:
+        req = _req("what is 2+2", effort="low")
+        _run_middleware(ctx, req, turn="tf3", session="fb3")
+        assert req["reasoning_effort"] == "medium"  # low + 1 bias
+    finally:
+        core._run_judges = orig
+        _reset_feedback()
+
+
+def test_feedback_decays_after_clean_streak():
+    _reset_feedback()
+    ctx = FakeCtx({})
+    core._plugin_ctx = ctx
+    core.on_api_request_error(session_id="fb4", turn_id="t", reason="incomplete_response",
+                              error={"type": "APIError", "message": "truncated"})
+    assert core._session_bias.get("fb4") == 1
+    for turn in ("c1", "c2"):
+        core.on_post_api_request(session_id="fb4", api_call_count=1, model="glm-5.3",
+                                 finish_reason="stop", usage={"prompt_tokens": 10},
+                                 context_length=65536, api_duration=0.5)
+    assert core._session_bias.get("fb4", 0) == 0  # two clean turns decay the bias
+    _reset_feedback()
+
+
+def test_feedback_bias_caps_at_two():
+    _reset_feedback()
+    core._plugin_ctx = FakeCtx({})
+    for _ in range(4):
+        core.on_api_request_error(session_id="fb5", turn_id="t", reason="incomplete_response",
+                                  error={"type": "APIError", "message": "truncated"})
+    assert core._session_bias.get("fb5") == 2  # capped, never runaway
+    v = J.Verdict("low", "quick", "stub", sure=0.9)
+    ctx = FakeCtx({"judge_backend": "jev"})
+    core._plugin_ctx = ctx
+    orig = core._run_judges
+    core._run_judges = lambda cfg, p, c, x: (v, "")
+    try:
+        req = _req("what is 2+2", effort="low")
+        _run_middleware(ctx, req, turn="tf5", session="fb5")
+        assert req["reasoning_effort"] == "high"  # low + 2 bias
+    finally:
+        core._run_judges = orig
+        _reset_feedback()
+
+
+def test_feedback_reapply_escalates_on_retry():
+    _reset_feedback()
+    ctx = FakeCtx({"judge_backend": "jev"})
+    core._plugin_ctx = ctx
+    v = J.Verdict("medium", "normal", "stub", sure=0.9)
+    orig = core._run_judges
+    core._run_judges = lambda cfg, p, c, x: (v, "")
+    try:
+        req = _req()
+        _run_middleware(ctx, req, turn="t7", session="fbr")
+        assert req["reasoning_effort"] == "medium"
+        # the turn failed after the judge ran: Hermes retries the same turn
+        core.on_api_request_error(session_id="fbr", turn_id="t7", reason="incomplete_response",
+                                  error={"type": "APIError", "message": "truncated"})
+        req2 = _req()
+        res = core.on_llm_request(req2, session_id="fbr", turn_id="t7", model="glm-5.3")
+        assert req2["reasoning_effort"] == "high"  # retry ships one step MORE thinking
+        assert res and "failure bias" in res["reason"]
+    finally:
+        core._run_judges = orig
+        _reset_feedback()
+
+
+def test_feedback_disabled_setting():
+    _reset_feedback()
+    ctx = FakeCtx({"judge_backend": "jev", "feedback_enabled": False})
+    core._plugin_ctx = ctx
+    core.on_api_request_error(session_id="fboff", turn_id="t", reason="incomplete_response",
+                              error={"type": "APIError", "message": "truncated"})
+    assert core._session_bias.get("fboff", 0) == 0
+    _reset_feedback()
+
+
+def test_feedback_recorded_in_verdict_log():
+    _reset_feedback()
+    ctx = FakeCtx({})
+    core._plugin_ctx = ctx
+    core.on_api_request_error(session_id="fbl", turn_id="t", reason="incomplete_response",
+                              error={"type": "APIError", "message": "truncated"})
+    notes = [v.get("note", "") for v in ctx.state.get("verdicts") or []]
+    assert any("failure feedback" in n for n in notes)
+    _reset_feedback()
+
+
+def test_session_dicts_bounded():
+    _reset_feedback()
+    core._last_turn.clear()
+    for i in range(300):
+        core._last_turn[f"s{i}"] = "t"
+        core._session_bias[f"s{i}"] = 1
+    core._prune_sessions()
+    assert len(core._last_turn) <= 200
+    assert len(core._session_bias) <= 200
+    core._last_turn.clear()
+    _reset_feedback()
+
+
+def test_stats_shows_active_failure_bias():
+    _reset_feedback()
+    ctx = FakeCtx()
+    core._plugin_ctx = ctx
+    core._session_bias["s1"] = 1
+    try:
+        out = core._fmt_stats(ctx)
+        assert "failure bias" in out
+    finally:
+        _reset_feedback()
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):

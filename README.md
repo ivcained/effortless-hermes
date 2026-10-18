@@ -150,3 +150,14 @@ MIT. Judge prompts and heuristics adapted from HeyCubit/effortless (MIT).
   "'reasoning_effort' must be one of: 'low', 'high', 'max'". Wire vocabularies
   now take `base_url`/`tools`, and cached per-turn efforts are re-clamped on
   retry re-apply instead of being pasted verbatim.
+
+- 0.4.0 (2026-10-18): outcome feedback loop. A quality-class failure (reason
+  `incomplete_response`/`empty_response`, or `finish_reason=error`) escalates
+  that session's effort one step for the next turn AND for retries of the
+  failed turn (retries now ship more thinking, not the verdict that just
+  failed). Bias caps at +2; two clean first-calls decay it one step. Rate
+  limit, auth, billing and request-shape 400s never escalate — those are not
+  thinking problems. New `api_request_error` observer registration, new
+  `feedback_enabled` setting (default true), `failure bias` line in
+  `/effortless stats`, `finish_reason` recorded per turn, and the per-session
+  maps are now bounded (200 sessions) so long-lived gateways don't leak.

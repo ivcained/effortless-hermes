@@ -1,5 +1,5 @@
 name: effortless-hermes
-version: 0.3.2
+version: 0.4.0
 description: "Picks the reasoning effort for every prompt via a fast judge (Jev/TypeSafe, a local model, or any custom OpenAI-compatible API) and rewrites the LLM request before it ships. Port of HeyCubit/effortless."
 author: "ivcained"
 license: MIT
@@ -11,6 +11,7 @@ optional_env:
 tags: [reasoning, effort, cost, judge]
 provides_hooks:
   - post_api_request
+  - api_request_error
 provides_middleware:
   - llm_request
 config_schema:
@@ -80,3 +81,7 @@ config_schema:
     type: bool
     default: false
     description: "Apply model_map even in established chats, accepting the prompt-cache reset it costs."
+  feedback_enabled:
+    type: bool
+    default: true
+    description: "Outcome feedback loop: a failed turn (incomplete/empty response, finish_reason=error) escalates that session's effort one step (max +2) for the next turn and its retries; two clean turns decay it. Rate-limit, auth, billing and request-shape errors never escalate."

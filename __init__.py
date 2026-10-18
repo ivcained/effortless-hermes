@@ -31,6 +31,80 @@ _last_effort: dict[str, str] = {}        # session_id -> effort applied this tur
 _last_model: dict[str, str] = {}         # session_id -> model override applied this turn
 _plugin_ctx: Any = None                  # for the /effortless command
 
+# v0.4 outcome feedback: a failed turn escalates the session's effort, a
+# streak of clean turns decays it back. Quality-class failures only
+# (incomplete/empty responses, finish_reason=error) — rate limits, auth,
+# billing and request-shape 400s never get "fixed" with more thinking.
+_MAX_SESSIONS = 200
+_FAILURE_BIAS_MAX = 2
+_CLEAN_STREAK_TARGET = 2
+_ESCALATE_REASONS = frozenset({"incomplete_response", "empty_response"})
+_session_bias: dict[str, int] = {}       # session_id -> +steps on the effort ladder
+_clean_streak: dict[str, int] = {}       # session_id -> consecutive clean first-calls
+
+
+def _prune_sessions() -> None:
+    """Bound the per-session maps: a long-lived gateway sees unbounded sessions."""
+    for d in (_last_turn, _last_effort, _last_model, _session_bias, _clean_streak):
+        if len(d) > _MAX_SESSIONS:
+            for stale in list(d)[:-_MAX_SESSIONS]:
+                d.pop(stale, None)
+
+
+def _bump_failure(session_id: str, why: str) -> None:
+    with _lock:
+        bias = min(_session_bias.get(session_id, 0) + 1, _FAILURE_BIAS_MAX)
+        _session_bias[session_id] = bias
+        _clean_streak[session_id] = 0
+        _prune_sessions()
+    try:
+        _record(_plugin_ctx, None, "", f"failure feedback: session bias +{bias} ({why})")
+    except Exception:
+        pass
+
+
+def _note_clean_turn(session_id: str) -> None:
+    with _lock:
+        if session_id not in _session_bias:
+            return  # nothing to decay
+        streak = _clean_streak.get(session_id, 0) + 1
+        if streak >= _CLEAN_STREAK_TARGET:
+            bias = _session_bias.get(session_id, 0)
+            if bias <= 1:
+                _session_bias.pop(session_id, None)
+                _clean_streak.pop(session_id, None)
+                return
+            _session_bias[session_id] = bias - 1
+            streak = 0
+        _clean_streak[session_id] = streak
+
+
+def _feedback_enabled() -> bool:
+    ctx_obj = _plugin_ctx
+    if ctx_obj is None:
+        return True
+    try:
+        return bool(_cfg(ctx_obj, "feedback_enabled", True))
+    except Exception:
+        return True
+
+
+def on_api_request_error(**payload: Any) -> None:
+    """Observer hook: a quality-class provider failure escalates the session's
+    effort for the next judged turn (and for a retry of the failed one)."""
+    try:
+        if not _feedback_enabled():
+            return
+        session_id = str(payload.get("session_id") or "")
+        if not session_id:
+            return
+        reason = str(payload.get("reason") or "")
+        if reason not in _ESCALATE_REASONS:
+            return
+        _bump_failure(session_id[:40], reason)
+    except Exception:
+        logger.debug("effortless-hermes: failure feedback tracking failed", exc_info=True)
+
 
 # ── message helpers ──────────────────────────────────────────────────────────
 
@@ -140,10 +214,19 @@ def _record(ctx_obj: Any, verdict: Optional[J.Verdict], prompt: str, note: str,
 
 
 def on_post_api_request(**payload: Any) -> None:
-    """Observer hook: keep the last turns' token usage for stats and the context meter."""
+    """Observer hook: keep the last turns' token usage for stats and the context
+    meter, and feed the v0.4 outcome loop (finish_reason=error escalates the
+    session's effort; clean turns decay it)."""
     try:
         if int(payload.get("api_call_count") or 0) != 1:
             return  # one record per turn (the first request carries the full context)
+        session_id = str(payload.get("session_id") or "")[:40]
+        finish_reason = str(payload.get("finish_reason") or "")
+        if session_id and _feedback_enabled():
+            if finish_reason == "error":
+                _bump_failure(session_id, "finish_reason=error")
+            else:
+                _note_clean_turn(session_id)
         usage = payload.get("usage") or {}
 
         def _tok(*names: str) -> Optional[int]:
@@ -155,8 +238,9 @@ def on_post_api_request(**payload: Any) -> None:
 
         entry = {
             "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "session_id": str(payload.get("session_id") or "")[:40],
+            "session_id": session_id,
             "model": str(payload.get("model") or "")[:60],
+            "finish_reason": finish_reason or None,
             "input_tokens": _tok("prompt_tokens", "input_tokens"),
             "output_tokens": _tok("completion_tokens", "output_tokens"),
             "total_tokens": _tok("total_tokens"),
@@ -208,7 +292,7 @@ _CFG_DEFAULTS = [
     ("local_base_url", "http://127.0.0.1:8080/v1"), ("local_model", ""),
     ("custom_base_url", ""), ("custom_model", ""), ("judge_timeout_seconds", 3.0),
     ("effort_floor", "low"), ("effort_ceiling", "max"), ("effort_bias", 0),
-    ("model_map", {}), ("model_map_always", False),
+    ("model_map", {}), ("model_map_always", False), ("feedback_enabled", True),
 ]
 
 
@@ -305,6 +389,12 @@ def _on_llm_request(request: dict, **ctx: Any) -> Optional[dict]:
     turn_id = str(ctx.get("turn_id") or "")
     base_url = str(ctx.get("base_url") or "")
 
+    floor = str(cfg["effort_floor"]); ceiling = str(cfg["effort_ceiling"])
+    feedback_on = bool(cfg.get("feedback_enabled", True))
+    with _lock:
+        session_bias = _session_bias.get(session_id, 0) if feedback_on else 0
+        _prune_sessions()
+
     # sanitize an effort the provider would reject (e.g. a config-level
     # 'medium' on a route that only accepts low/high/max). Runs on EVERY
     # request — follow-ups, judge-down turns and retries can ship a 400 too,
@@ -340,6 +430,13 @@ def _on_llm_request(request: dict, **ctx: Any) -> Optional[dict]:
                 clamped = J.clamp_to_wire(
                     cached_effort, r_model, base_url, request.get("tools"))
                 cached_effort = clamped
+                if session_bias:
+                    # the turn failed after it was judged: the retry ships one
+                    # step MORE thinking, not the same verdict that just failed
+                    cached_effort = J.apply_bounds(
+                        cached_effort, floor, ceiling, session_bias)
+                    cached_effort = J.clamp_to_wire(
+                        cached_effort, r_model, base_url, request.get("tools"))
             changed = False
             if cached_effort and _write_effort(request, cached_effort):
                 changed = True
@@ -347,8 +444,11 @@ def _on_llm_request(request: dict, **ctx: Any) -> Optional[dict]:
                 request["model"] = cached_model
                 changed = True
             if changed:
+                reason = f"reapply {cached_effort} (retried request)"
+                if session_bias:
+                    reason += f" (+{session_bias} failure bias)"
                 return {"request": request, "source": "effortless-hermes",
-                        "reason": f"reapply {cached_effort} (retried request)"}
+                        "reason": reason}
             return _ret(None)  # tool-loop follow-ups keep the request as built
         _last_turn[session_id] = turn_id
 
@@ -368,8 +468,8 @@ def _on_llm_request(request: dict, **ctx: Any) -> Optional[dict]:
     def _clamp(effort: str) -> str:
         return J.clamp_to_wire(effort, model, base_url, request_tools)
 
-    floor = str(cfg["effort_floor"]); ceiling = str(cfg["effort_ceiling"])
-    bias = int(cfg["effort_bias"] or 0)
+    # judge verdict + any failure-feedback bias from this session's outcomes
+    bias = int(cfg["effort_bias"] or 0) + session_bias
 
     # 1. named level in the message wins, no judge
     named = J.named_effort(prompt)
@@ -413,6 +513,8 @@ def _on_llm_request(request: dict, **ctx: Any) -> Optional[dict]:
         _record(ctx_obj, verdict, prompt, f"-> {effort} (was {current_effort})",
                 extra={"model_override": applied_model})
         reason = f"{verdict.by}: {effort}"
+        if session_bias:
+            reason += f" (+{session_bias} failure bias)"
         if verdict.why and verdict.why != "unsure, keeping":
             reason += f" ({verdict.why})"
         if applied_model:
@@ -459,6 +561,10 @@ def _fmt_stats(ctx_obj: Any) -> str:
         fill = _context_fill(last)
         lines.append(f"last turn: {last.get('model', '?')} · {last.get('input_tokens', '?')} in"
                      + (f" · {fill}% of window" if fill is not None else ""))
+    biased = {s: b for s, b in _session_bias.items() if b}
+    if biased:
+        recent = ", ".join(f"{s[:12]}… +{b}" for s, b in list(biased.items())[-5:])
+        lines.append(f"failure bias: {len(biased)} session(s) ({recent})")
     return "\n".join(lines)
 
 
@@ -513,6 +619,10 @@ def register(ctx) -> None:
         ctx.register_hook("post_api_request", on_post_api_request)
     except Exception:
         logger.debug("effortless-hermes: post_api_request hook registration failed", exc_info=True)
+    try:
+        ctx.register_hook("api_request_error", on_api_request_error)
+    except Exception:
+        logger.debug("effortless-hermes: api_request_error hook registration failed", exc_info=True)
     try:
         ctx.register_command("effortless", _command_effortless,
                              description="effortless-hermes: verdicts, 'test' the judges, "
